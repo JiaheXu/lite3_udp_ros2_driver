@@ -1,0 +1,2 @@
+gst-launch-1.0 rtspsrc location=rtsp://192.168.1.120:8554/test protocols=tcp latency=0 drop-on-latency=true ! \
+rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false

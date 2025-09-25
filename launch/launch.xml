@@ -1,0 +1,4 @@
+<launch>
+    <node pkg="lite3_udp_ros2_driver" exec="motion_server" name="motion_server_node" output="screen">
+</launch>
+
