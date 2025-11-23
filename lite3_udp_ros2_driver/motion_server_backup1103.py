@@ -37,7 +37,7 @@ class MotionServer(Node):
         self.state = "sit"
         self.mode = "manual"
         self.behavior_mode = 0
-        self.desired_speed = 0.4
+        self.desired_speed = 0.6
         self.pending_timers = []
 
         # --- Publishers ---
@@ -74,18 +74,42 @@ class MotionServer(Node):
             30: self.navigate_prepare,
         }
 
+        # --- Subscribers ---
+        self.simple_cmd_sub = self.create_subscription(
+            SimpleCMD,
+            "simple_cmd",
+            self.safe_wrapper(self.simple_cmd_callback),
+            10,
+            callback_group=self.cmd_group,
+        )
+        self.motion_cmd_sub = self.create_subscription(
+            Int32,
+            "motion_cmd",
+            self.safe_wrapper(self.motion_callback),
+            10,
+            callback_group=self.cmd_group,
+        )
+        self.cmd_vel_sub = self.create_subscription(
+            TwistStamped,
+            "cmd_vel",
+            self.safe_wrapper(self.cmd_vel_callback),
+            10,
+            callback_group=self.cmd_group,
+        )
+        self.behavior_mode_sub = self.create_subscription(
+            Int32,
+            "behavior_mode",
+            self.safe_wrapper(self.behavior_callback),
+            10,
+            callback_group=self.cmd_group,
+        )
+
         # --- Timers ---
         self.create_timer(0.1, self.safe_wrapper(self.recv_state), callback_group=self.state_group)
         self.create_timer(0.5, self.safe_wrapper(self.timer_callback), callback_group=self.timer_group)
 
         # --- Init sequence ---
         self.init()
-
-        # --- Subscribers ---
-        self.create_subscription(SimpleCMD, "simple_cmd", self.safe_wrapper(self.simple_cmd_callback), 10, callback_group=self.cmd_group)
-        self.create_subscription(Int32, "motion_cmd", self.safe_wrapper(self.motion_callback), 10, callback_group=self.cmd_group)
-        self.create_subscription(TwistStamped, "cmd_vel", self.safe_wrapper(self.cmd_vel_callback), 10, callback_group=self.cmd_group)
-        self.create_subscription(Int32, "behavior_mode", self.safe_wrapper(self.behavior_callback), 10, callback_group=self.cmd_group)
 
         self.get_logger().info("----- motion_server node up -----")
 
@@ -111,7 +135,7 @@ class MotionServer(Node):
         self.pending_timers.append(timer)
         return timer
 
-    def publish_audio(self, text: str, cmd: str = 'speak', voice: str = 'zf_xiaoyi', volume: float = 1.2, speed: float = 0.9):
+    def publish_audio(self, text: str, cmd: str = 'speak', voice: str = 'zf_xiaoyi', volume: float = 1.2, speed: float = 0.8):
         msg = AudioMSG()
         msg.cmd = cmd
         msg.text = text
@@ -119,7 +143,7 @@ class MotionServer(Node):
         msg.volume = volume
         msg.speed = speed
         self.audio_pub.publish(msg)
-        print('sent msg: ', text)
+        # print('sent msg: ', text)
 
     # -------- Timers -------- #
     def timer_callback(self):
@@ -156,6 +180,7 @@ class MotionServer(Node):
 
     # -------- Motion callbacks -------- #
     def motion_callback(self, msg: Int32):
+        self.get_logger().info(f"[motion_cmd] received: {msg.data}")
         func = self.motions.get(msg.data)
         if func:
             func()
@@ -176,7 +201,7 @@ class MotionServer(Node):
         self.send_simple_cmd(0x21010C05, 0, 0)
 
     def faster(self):
-        self.desired_speed = min(self.desired_speed + 0.2, 0.8)
+        self.desired_speed = min(self.desired_speed + 0.2, 1.2)
 
     def slower(self):
         self.desired_speed = max(self.desired_speed - 0.2, 0.2)
@@ -190,27 +215,29 @@ class MotionServer(Node):
         self.arm_init()
         self.send_simple_cmd(0x21012109, 0, 0)
         time.sleep(0.1)
-        self.publish_audio("启动初始化，请稍候。")
-        self.send_simple_cmd(0x2101210d, 0, 0)
-        time.sleep(10.0)
-        # Request stand
-        self.stand()
+        # self.publish_audio("启动初始化，请稍候。")
 
-        # Wait until robot actually reports stand
-        max_wait = 20.0   # seconds
-        dt = 0.1
-        waited = 0.0
-        while self.state != "stand" and waited < max_wait:
-            rclpy.spin_once(self, timeout_sec=dt)
-            waited += dt
-        print('init state: ', self.state)
-        if self.state == "stand":
-            self.get_logger().info("✅ Robot confirmed standing, moving forward")
-            # self.publish_audio("你好主人，我是今天为您服务的导览机器人，很高兴为您服务！")
-            self.move_forward()
-        else:
-            self.get_logger().warn("⚠️ Stand not confirmed within timeout.")
-            self.publish_audio("初始化未完成，请检查机器人状态。")
+        self.send_simple_cmd(0x2101210d, 0, 0)
+        time.sleep(8.0)
+        # Request stand
+        # self.stand()
+
+        # # Wait until robot actually reports stand
+        # max_wait = 20.0   # seconds
+        # dt = 0.1
+        # waited = 0.0
+        # while self.state != "stand" and waited < max_wait:
+        #     rclpy.spin_once(self, timeout_sec=dt)
+        #     waited += dt
+        #     # self.stand()
+        # print('init state: ', self.state)
+        # if self.state == "stand":
+        #     self.get_logger().info("✅ Robot confirmed standing, moving forward")
+        #     self.publish_audio("你好主人，我是今天为您服务的导览机器人，很高兴为您服务！")
+        #     # self.move_forward()
+        # else:
+        #     self.get_logger().warn("⚠️ Stand not confirmed within timeout.")
+        #     self.publish_audio("初始化未完成，请检查机器人状态。")
 
     def manual(self):
         self.send_simple_cmd(0x21010C02, 0, 0)
@@ -222,6 +249,7 @@ class MotionServer(Node):
 
     def stand(self):
         self.get_logger().info("Requesting STAND (same cmd as SIT)")
+        print("self.state: ", self.state)
         if(self.state == 'sit'):
             self.send_simple_cmd(0x21010202, 0, 0)
             # self.state = "stand"   # optimistic, recv_state will confirm
@@ -275,6 +303,10 @@ class MotionServer(Node):
         if self.behavior_mode < 2:
             return
         cmd = msg.twist
+        # if( abs(cmd.angular.z) < 0.05):
+            # cmd.angular.z = 
+        # if( abs(cmd.angular.z) > 0.2):
+            # cmd.angular.z = cmd.angular.z * 2.0
         self.send_complex_cmd(320, 8, 1, cmd.linear.x)
         self.send_complex_cmd(325, 8, 1, cmd.linear.y)
         self.send_complex_cmd(321, 8, 1, -cmd.angular.z)
@@ -290,6 +322,7 @@ class MotionServer(Node):
 
     # -------- UDP helpers -------- #
     def send_simple_cmd(self, cmd_code: int, cmd_value: int, cmd_type: int):
+        # return
         try:
             packet = struct.pack("<iii", cmd_code, cmd_value, cmd_type)
             self.sock.sendto(packet, self.qnx_addr)
