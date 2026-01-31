@@ -88,7 +88,7 @@ class StateMachine(Node):
                     self.gps_stable = False
                     self.get_logger().warn(f"⚠️ GPS unstable: freq={freq:.2f}Hz, dist={dist:.2f}m")
             else:
-                self.publish_audio(text = "已接收到卫星信号！！！")
+                # self.publish_audio(text = "卫星信号！！！")
                 self.get_logger().info("⏳ Waiting for GPS history...")
 
 
@@ -121,7 +121,9 @@ class StateMachine(Node):
         msg.data = self.state
         self.mode_pub.publish(msg)
         now = time.time()
-        if(now - self.last_gps_time > 4.0):
+        if self.last_gps_time is None:
+            self.gps_stable = False
+        elif (now - self.last_gps_time > 4.0):
             self.last_gps_time = None
             self.gps_stable = False
 
@@ -129,7 +131,7 @@ class StateMachine(Node):
             # self.publish_audio("注意，当前GPS信号不稳定。")
         if self.state == self.NAVIGATION:
             if(  (not self.gps_stable ) or (self.last_gps_time is None) ) :
-                self.publish_audio("注意，当前GPS信号不稳定，已切换至牵引模式")
+                self.publish_audio("注意,当前GPS信号不稳定,已切换至牵引模式")
                 self.get_logger().warn("❌ Navigation blocked: GPS unstable")
                 self.state = self.INIT
 

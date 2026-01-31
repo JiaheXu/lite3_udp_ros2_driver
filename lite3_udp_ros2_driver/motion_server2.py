@@ -22,18 +22,19 @@ class MotionServer(Node):
     def __init__(self):
         super().__init__('motion_server')
         self.NAVIGATION = 2
-        self.no_response_timeout = 3.0
-        self.reconnect_cooldown = 2.0
 
         # --- Callback groups ---
         self.cmd_group = ReentrantCallbackGroup()
         self.state_group = MutuallyExclusiveCallbackGroup()
         self.timer_group = MutuallyExclusiveCallbackGroup()
 
-        # --- UDP sockets ---
-        self.sock = None
-        self.state_sock = None
-        self._setup_udp_sockets()
+        # --- UDP socket ---
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.bind(("0.0.0.0", 43897))
+            self.sock.setblocking(False)
+        except Exception as e:
+            self.get_logger().error(f"Failed to bind socket: {e}\n{traceback.format_exc()}")
 
         # Robot addr
         self.qnx_addr = ("192.168.1.120", 43893)
@@ -48,23 +49,15 @@ class MotionServer(Node):
         self.pending_motion_cmd = None
         self.pending_motion_after_stand = None
         self.active_motion_timer = None
-        now = self.get_clock().now().nanoseconds * 1e-9
-        self.last_state_rx_time = now
-        self.last_state2_rx_time = now
-        self.last_reconnect_time = 0.0
 
         # Track cmd_vel activity
         self.cmd_vel_active = False
         self.last_cmd_vel_time = 0.0
-        # Track joystick yaw override in nav/wander
-        self.last_joy_time = 0.0
-        self.last_joy_yaw = 0.0
 
         # --- Publishers ---
         self.state_pub = self.create_publisher(String, "robot_state", 10)
         self.audio_pub = self.create_publisher(AudioMSG, "audio_cmd", 10)
         self.speed_pub = self.create_publisher(Float32, "desired_speed", 10)
-        self.battery_pub = self.create_publisher(Float32, "battery_level", 10)
 
         # --- Motion map ---
         self.motions = {
@@ -135,7 +128,6 @@ class MotionServer(Node):
 
         # --- Timers ---
         self.create_timer(0.1, self.safe_wrapper(self.recv_state), callback_group=self.state_group)
-        self.create_timer(0.1, self.safe_wrapper(self.recv_state2), callback_group=self.state_group)
         self.create_timer(0.5, self.safe_wrapper(self.timer_callback), callback_group=self.timer_group)
 
         # --- Init sequence ---
@@ -184,68 +176,61 @@ class MotionServer(Node):
         msg = Float32()
         msg.data = self.desired_speed
         self.speed_pub.publish(msg)
-        self._check_udp_health()
 
     # -------------------------------------------------------------
     # State receiver
     # -------------------------------------------------------------
-    def recv_state(self):
-        try:
-            data, addr = self.sock.recvfrom(2048)
-            self.last_state_rx_time = self.get_clock().now().nanoseconds * 1e-9
-            
-            if len(data) == 28:
-                data_hex = str(data.hex())
-                state = data_hex[-32:-28]
-                state_msg = None
-
-                if state == "0100":
-                    self.state = "sit"
-                    state_msg = "sit"
-
-                if state == "1000":
-                    self.state = "stand"
-                    state_msg = "stand"
-
-                    if self.pending_motion_after_stand:
-                        cmd = self.pending_motion_after_stand
-                        self.pending_motion_after_stand = None
-                        self.get_logger().info("Executing deferred motion after stand")
-                        self._start_timed_motion(*cmd)
-
-                if state_msg:
-                    msg = String()
-                    msg.data = state_msg
-                    self.state_pub.publish(msg)
-
-        except BlockingIOError:
-            pass
-        except Exception as e:
-            self.get_logger().error(f"recv_state failed: {e}\n{traceback.format_exc()}")
-
     def recv_state2(self):
         try:
-            data, addr = self.state_sock.recvfrom(2048)
-            self.last_state2_rx_time = self.get_clock().now().nanoseconds * 1e-9
+            data, addr = self.sock.recvfrom(2048)
+            # print("RECIEVED:", len(data))
 
             if len(data) != 220:
+                # print("Packet size mismatch")
                 return
 
             code, size, cons_code = struct.unpack_from("<iii", data, 0)
             base = 12  # RobotState starts here
 
-            robot_basic_state = struct.unpack_from("<i", data, base)[0]
-            battery_level = struct.unpack_from("<d", data, base + 176)[0]
+            # raw 4 bytes
+            raw_bytes = data[base : base + 4]
 
-            # Publish battery level
-            msg = Float32()
-            msg.data = float(battery_level)
-            self.battery_pub.publish(msg)
+            # parsed int
+            robot_basic_state = struct.unpack_from("<i", data, base)[0]
+
+            print(
+                f"robot_basic_state raw bytes = {raw_bytes.hex()} "
+                f"(int={robot_basic_state})"
+            )
+
+            # robot_motion_state = struct.unpack_from("<i", data, base + 172)[0]
+            battery_level      = struct.unpack_from("<d", data, base + 176)[0]
+
+            print(f"state: {robot_basic_state} , battery {battery_level}")
+            state_msg = None
+            if robot_basic_state == 5: #16
+                self.state = "stand"
+                state_msg = "stand"
+
+            if robot_basic_state == 1: # 17 98
+                self.state = "sit"
+                state_msg = "sit"
+
+                    # if self.pending_motion_after_stand:
+                    #     cmd = self.pending_motion_after_stand
+                    #     self.pending_motion_after_stand = None
+                    #     self.get_logger().info("Executing deferred motion after stand")
+                    #     self._start_timed_motion(*cmd)
+
+            if state_msg:
+                msg = String()
+                msg.data = state_msg
+                self.state_pub.publish(msg)
 
         except BlockingIOError:
             pass
         except Exception as e:
-            self.get_logger().error(f"recv_state2 failed: {e}\n{traceback.format_exc()}")
+            self.get_logger().error(f"recv_state failed: {e}\n{traceback.format_exc()}")
 
     # -------------------------------------------------------------
     # Motion command callbacks
@@ -408,13 +393,6 @@ class MotionServer(Node):
         if not turning:
             self.send_complex_cmd(320, 8, 1, cmd.linear.x)
         self.send_complex_cmd(325, 8, 1, cmd.linear.y)
-        # In nav/wander, if joystick recently moved, override yaw with joystick.
-        if self.behavior_mode in (2, 3):
-            now = self.get_clock().now().nanoseconds * 1e-9
-            joy_recent = (now - self.last_joy_time) < 0.3
-            if joy_recent and abs(self.last_joy_yaw) > 0.01:
-                self.send_complex_cmd(321, 8, 1, self.last_joy_yaw)
-                return
         self.send_complex_cmd(321, 8, 1, -cmd.angular.z)
 
     # -------------------------------------------------------------
@@ -445,13 +423,10 @@ class MotionServer(Node):
 
         # Forward/backward linear mapping to joystick x when outside deadzone.
         if abs(sx) > TH:
-            forward = max(min(sx * 1.5, 1.5), -0.8)
+            forward = max(min(sx * 2.0, 1.0), -1.0)
         else:
             forward = 0.0
         turning = sy * 1.2 if abs(sy) > TH else 0.0
-        # Record latest joystick yaw intent for nav/wander override
-        self.last_joy_time = now
-        self.last_joy_yaw = turning
         yaw_override = False
         if self.behavior_mode in (2, 3):
             forward = 0.0
@@ -516,44 +491,6 @@ class MotionServer(Node):
     # -------------------------------------------------------------
     # UDP send helpers
     # -------------------------------------------------------------
-    def _create_udp_socket(self, bind_addr):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(bind_addr)
-        sock.setblocking(False)
-        return sock
-
-    def _setup_udp_sockets(self):
-        for s in (self.sock, self.state_sock):
-            try:
-                if s:
-                    s.close()
-            except Exception:
-                pass
-        try:
-            self.sock = self._create_udp_socket(("0.0.0.0", 43900))  # 43987
-        except Exception as e:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.setblocking(False)
-            self.get_logger().error(f"Failed to bind socket: {e}\n{traceback.format_exc()}")
-        try:
-            self.state_sock = self._create_udp_socket(("0.0.0.0", 43897))
-        except Exception as e:
-            self.state_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.state_sock.setblocking(False)
-            self.get_logger().error(f"Failed to bind state socket: {e}\n{traceback.format_exc()}")
-
-    def _check_udp_health(self):
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if now - self.last_reconnect_time < self.reconnect_cooldown:
-            return
-        if (now - self.last_state_rx_time) > self.no_response_timeout or (now - self.last_state2_rx_time) > self.no_response_timeout:
-            self.last_reconnect_time = now
-            self.get_logger().warn(
-                "No UDP response detected; reconnecting sockets."
-            )
-            self._setup_udp_sockets()
-
     def send_simple_cmd(self, cmd_code: int, cmd_value: int, cmd_type: int):
         try:
             packet = struct.pack("<iii", cmd_code, cmd_value, cmd_type)
@@ -563,10 +500,10 @@ class MotionServer(Node):
 
     def send_complex_cmd(self, cmd_code: int, cmd_value: int, cmd_type: int, data: float):
         try:
-            # self.get_logger().info(
-            #     f"[udp] send_complex_cmd: code={cmd_code}, value={cmd_value}, "
-            #     f"type={cmd_type}, data={data:+.3f}, addr={self.qnx_addr}"
-            # )
+            self.get_logger().info(
+                f"[udp] send_complex_cmd: code={cmd_code}, value={cmd_value}, "
+                f"type={cmd_type}, data={data:+.3f}, addr={self.qnx_addr}"
+            )
             packet = struct.pack("<iiid", cmd_code, cmd_value, cmd_type, data)
             self.sock.sendto(packet, self.qnx_addr)
         except Exception as e:
