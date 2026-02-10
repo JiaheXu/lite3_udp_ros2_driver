@@ -140,7 +140,7 @@ class StateMachine(Node):
             wp = PointStamped()
             wp.header.stamp = self.get_clock().now().to_msg()
             wp.header.frame_id = "base_link"
-            wp.point.x = 4.0
+            wp.point.x = 3.0
             wp.point.y = 0.0
             wp.point.z = 0.0
 
