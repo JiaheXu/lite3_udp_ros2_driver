@@ -22,6 +22,7 @@ class MotionServer(Node):
     def __init__(self):
         super().__init__('motion_server')
         self.NAVIGATION = 2
+        self.LAST_TIME = 15.0
         self.no_response_timeout = 3.0
         self.reconnect_cooldown = 2.0
 
@@ -48,6 +49,10 @@ class MotionServer(Node):
         self.pending_motion_cmd = None
         self.pending_motion_after_stand = None
         self.active_motion_timer = None
+        self.action_motion_active = False
+        self.action_motion_cmd = None
+        self.stop_cmd_active = False
+        self.stop_cmd_time = 0.0
         now = self.get_clock().now().nanoseconds * 1e-9
         self.last_state_rx_time = now
         self.last_state2_rx_time = now
@@ -74,12 +79,10 @@ class MotionServer(Node):
             0: self.stop,
             1: self.stand,
             2: self.sit,
-            3: self.move_forward,
-            4: self.move_backward,
-            5: self.turn_left,
-            6: self.turn_right,
-            7: self.faster,
-            8: self.slower,
+            3: self.display,
+            8: self.faster,
+            9: self.slower,
+            
             10: self.hand_heart,
             11: self.shake_body,
             12: self.space_step,
@@ -93,6 +96,8 @@ class MotionServer(Node):
             20: self.navigate_prepare,
             30: self.navigate_prepare,
         }
+        self.display_motion_cmds = {11, 14, 15, 16, 19}
+        self.action_motion_cmds = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 
         # --- Subscribers ---
         self.simple_cmd_sub = self.create_subscription(
@@ -253,6 +258,13 @@ class MotionServer(Node):
     def motion_callback(self, msg: Int32):
         cmd = msg.data
         self.get_logger().info(f"[motion_cmd] received: {cmd}")
+        if cmd == 0:
+            self.stop_cmd_active = True
+            self.stop_cmd_time = self.get_clock().now().nanoseconds * 1e-9
+            self.get_logger().info("Stop command active: blocking cmd_vel, joystick blocked for 3s")
+        else:
+            self.stop_cmd_active = False
+
         if not self.initialized:
             self.get_logger().info("Initialization in progress, deferring motion command")
             self.pending_motion_cmd = cmd
@@ -265,9 +277,26 @@ class MotionServer(Node):
             # Prevent motion conflicts when switching to a motion/posture command.
             if cmd not in (0, -3, -2, -1, 7, 8, 20, 30):
                 self.stop()
+
+            if cmd in self.action_motion_cmds:
+                self.action_motion_active = True
+                self.action_motion_cmd = cmd
+                self.get_logger().info(
+                    f"Action motion {cmd} requested: blocking cmd_vel/joystick until stop()"
+                )
+            elif cmd != 0:
+                self.action_motion_active = False
+                self.action_motion_cmd = None
             func()
         else:
             self.get_logger().warn(f"Unknown motion command: {cmd}")
+
+    def _motion_in_progress(self) -> bool:
+        return (
+            self.action_motion_active
+            or self.active_motion_timer is not None
+            or self.pending_motion_after_stand is not None
+        )
 
     # -------------------------------------------------------------
     # Basic motion helpers
@@ -281,6 +310,8 @@ class MotionServer(Node):
             self.active_motion_timer = None
         self.pending_motion_after_stand = None
         self.pending_motion_cmd = None
+        self.action_motion_active = False
+        self.action_motion_cmd = None
         self.send_simple_cmd(0x21010c0b, 0, 0)
 
     def ai_off(self):
@@ -377,20 +408,23 @@ class MotionServer(Node):
     # Preset motions
     # -------------------------------------------------------------
     def hand_heart(self): self.send_simple_cmd(0x21010508, 0, 0)
-    def shake_body(self): self.send_simple_cmd(0x21010204, 0, 0); self.schedule_once(10.0, self.stop)
-    def space_step(self): self.send_simple_cmd(0x2101030C, 0, 0); self.schedule_once(5.0, self.stop)
+    def shake_body(self): self.send_simple_cmd(0x21010204, 0, 0); self.schedule_once(self.LAST_TIME, self.stop)
+    def space_step(self): self.send_simple_cmd(0x2101030C, 0, 0); self.schedule_once(self.LAST_TIME, self.stop)
     def turning_jump(self): self.send_simple_cmd(0x2101020D, 0, 0)
-    def dance1(self): self.send_simple_cmd(0x21010521, 0, 0); self.schedule_once(10.0, self.stop)
-    def twist_butt(self): self.send_simple_cmd(0x21010509, 0, 0); self.schedule_once(5.0, self.stop)
+    def dance1(self): self.send_simple_cmd(0x21010521, 0, 0); self.schedule_once(self.LAST_TIME, self.stop)
+    def twist_butt(self): self.send_simple_cmd(0x21010509, 0, 0); self.schedule_once(self.LAST_TIME, self.stop)
     def wave_hand(self): self.send_simple_cmd(0x21010506, 0, 0)
     def jump_forward(self): self.send_simple_cmd(0x2101050B, 0, 0)
     def clap_hand(self): self.send_simple_cmd(0x21010507, 0, 0)
-    def dance2(self): self.send_simple_cmd(0x21010522, 0, 0); self.schedule_once(5.0, self.stop)
+    def dance2(self): self.send_simple_cmd(0x21010522, 0, 0); self.schedule_once(self.LAST_TIME, self.stop)
 
     # -------------------------------------------------------------
     # cmd_vel callback
     # -------------------------------------------------------------
     def cmd_vel_callback(self, msg: TwistStamped):
+        if self._motion_in_progress() or self.stop_cmd_active:
+            return
+
         # Mark active time
         self.cmd_vel_active = True
         self.last_cmd_vel_time = self.get_clock().now().nanoseconds * 1e-9
@@ -426,6 +460,10 @@ class MotionServer(Node):
         - If cmd_vel is active (within 0.3s): ignore forward/back from joystick but override yaw.
         - If no cmd_vel: joystick has full control (forward + turn).
         """
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self._motion_in_progress() or (now - self.stop_cmd_time) < 3.0:
+            return
+
         if self.state == "sit":
             # self.get_logger().info("[local_joystick] ignored: state=sit")
             return
@@ -437,7 +475,6 @@ class MotionServer(Node):
         sx = msg.axes[0]    # forward/back
         sy = msg.axes[1]    # turn left/right
 
-        now = self.get_clock().now().nanoseconds * 1e-9
         cmd_vel_recent = (now - self.last_cmd_vel_time) < 0.3
 
         # Deadzone
